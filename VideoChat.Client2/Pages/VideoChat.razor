@@ -1,0 +1,233 @@
+﻿@page "/videochat"
+@inject IJSRuntime JSRuntime
+@using Microsoft.AspNetCore.SignalR.Client
+@implements IAsyncDisposable
+
+<style>
+    .video-container {
+        display: flex;
+        gap: 20px;
+    }
+    video {
+        width: 320px;
+        height: 240px;
+        border: 1px solid black;
+        background: #000;
+    }
+</style>
+
+<div class="video-container">
+    <video id="localVideo" autoplay muted></video>
+    <video id="remoteVideo" autoplay></video>
+</div>
+
+<button @onclick="StartVideoCall">Start Call</button>
+<div>Status: @_statusMessage</div>
+
+@code {
+    private HubConnection? _hubConnection;
+    private IJSObjectReference? _jsModule;
+    private IJSObjectReference? _localStream;
+    private IJSObjectReference? _peerConnection;
+    private string _currentRoomId = "room1";
+    private string _currentUserId = Guid.NewGuid().ToString();
+    private string? _remoteUserId;
+    private string _statusMessage = "Initializing...";
+    private List<string> _pendingCandidates = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _hubConnection = new HubConnectionBuilder()
+                .WithUrl("http://localhost:5291/videoHub", options =>
+                {
+                    options.Transports = Microsoft.AspNetCore.Http.Connections.HttpTransportType.WebSockets;
+                })
+                .WithAutomaticReconnect()
+                .Build();
+
+            _hubConnection.On<string, string, string>("ReceiveSignal", HandleSignal);
+            _hubConnection.On<string, string>("UserJoined", async (userId, connectionId) =>
+            {
+                if (userId != _currentUserId)
+                {
+                    _remoteUserId = userId;
+                    _statusMessage = $"User {userId} joined";
+                    StateHasChanged();
+                    await StartVideoCall();
+                }
+            });
+
+            await _hubConnection.StartAsync();
+            _statusMessage = $"Connected (ID: {_currentUserId})";
+
+            _jsModule = await JSRuntime.InvokeAsync<IJSObjectReference>("import", "./js/webrtc.js");
+            _localStream = await _jsModule.InvokeAsync<IJSObjectReference>("initializeVideo", "localVideo");
+            var config = new { iceServers = new object[] { } };
+            _peerConnection = await _jsModule.InvokeAsync<IJSObjectReference>("createPeerConnection", config);
+
+            if (_peerConnection == null || _jsModule == null)
+            {
+                throw new InvalidOperationException("Failed to initialize WebRTC components");
+            }
+
+            await _jsModule.InvokeVoidAsync("setOnIceCandidate", _peerConnection, DotNetObjectReference.Create(this));
+            await _jsModule.InvokeVoidAsync("setOnTrack", _peerConnection, "remoteVideo");
+            await _jsModule.InvokeVoidAsync("addTracks", _peerConnection, _localStream);
+
+            await _hubConnection.InvokeAsync("JoinRoom", _currentRoomId, _currentUserId);
+            _statusMessage = "WebRTC initialized";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Init Error: {ex.Message}";
+            StateHasChanged();
+        }
+    }
+
+    private async Task StartVideoCall()
+    {
+        try
+        {
+            if (_remoteUserId == null)
+            {
+                _statusMessage = "Waiting for remote user";
+                StateHasChanged();
+                return;
+            }
+
+            if (_peerConnection == null || _jsModule == null)
+            {
+                _statusMessage = "WebRTC not initialized";
+                StateHasChanged();
+                return;
+            }
+
+            _statusMessage = "Starting call...";
+            StateHasChanged();
+
+            var offer = await _jsModule.InvokeAsync<string>("createOffer", _peerConnection);
+            Console.WriteLine($"Offer SDP: {offer}");
+            var signalData = System.Text.Json.JsonSerializer.Serialize(new SignalData("offer", offer));
+            await _hubConnection!.InvokeAsync("SendSignal", _currentRoomId, _remoteUserId, signalData);
+            _statusMessage = "Offer sent";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Start Error: {ex.Message}";
+            StateHasChanged();
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnIceCandidate(string candidate)
+    {
+        try
+        {
+            if (_remoteUserId == null || _hubConnection == null)
+            {
+                _pendingCandidates.Add(candidate);
+                _statusMessage = $"ICE candidate buffered ({_pendingCandidates.Count})";
+                StateHasChanged();
+                return;
+            }
+
+            var signalData = System.Text.Json.JsonSerializer.Serialize(new SignalData("candidate", candidate));
+            await _hubConnection.InvokeAsync("SendSignal", _currentRoomId, _remoteUserId, signalData);
+            _statusMessage = "ICE sent";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"ICE Error: {ex.Message}";
+            StateHasChanged();
+        }
+    }
+
+    private async Task HandleSignal(string senderConnectionId, string targetUserId, string signalData)
+    {
+        try
+        {
+            if (targetUserId != _currentUserId) return;
+
+            var signal = System.Text.Json.JsonSerializer.Deserialize<SignalData>(signalData);
+            if (signal == null)
+            {
+                _statusMessage = "Invalid signal";
+                StateHasChanged();
+                return;
+            }
+
+            if (_peerConnection == null || _jsModule == null)
+            {
+                _statusMessage = "WebRTC not initialized";
+                StateHasChanged();
+                return;
+            }
+
+            _remoteUserId = senderConnectionId;
+            _statusMessage = $"Received {signal.Type}";
+            StateHasChanged();
+
+            if (signal.Type == "offer")
+            {
+                await _jsModule.InvokeVoidAsync("setRemoteDescription", _peerConnection, signal.Data);
+                var answer = await _jsModule.InvokeAsync<string>("createAnswer", _peerConnection);
+                Console.WriteLine($"Answer SDP: {answer}");
+                var answerData = System.Text.Json.JsonSerializer.Serialize(new SignalData("answer", answer));
+                await _hubConnection!.InvokeAsync("SendSignal", _currentRoomId, _remoteUserId, answerData);
+                _statusMessage = "Answer sent";
+
+                foreach (var candidate in _pendingCandidates)
+                {
+                    await _jsModule.InvokeVoidAsync("addIceCandidate", _peerConnection, candidate);
+                    _statusMessage = "Pending ICE added";
+                }
+                _pendingCandidates.Clear();
+            }
+            else if (signal.Type == "answer")
+            {
+                await _jsModule.InvokeVoidAsync("setRemoteDescription", _peerConnection, signal.Data);
+                _statusMessage = "Answer applied";
+
+                foreach (var candidate in _pendingCandidates)
+                {
+                    await _jsModule.InvokeVoidAsync("addIceCandidate", _peerConnection, candidate);
+                    _statusMessage = "Pending ICE added";
+                }
+                _pendingCandidates.Clear();
+            }
+            else if (signal.Type == "candidate")
+            {
+                await _jsModule.InvokeVoidAsync("addIceCandidate", _peerConnection, signal.Data);
+                _statusMessage = "ICE added";
+            }
+
+            var states = await _jsModule.InvokeAsync<ConnectionStates>("getConnectionStates", _peerConnection);
+            _statusMessage += $" | ICE: {states.IceState}, Conn: {states.ConnState}, Sig: {states.SigState}";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Signal Error: {ex.Message}";
+            StateHasChanged();
+        }
+    }
+
+    private record SignalData(string Type, string Data);
+    private record ConnectionStates(string IceState, string ConnState, string SigState);
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_hubConnection != null) await _hubConnection.DisposeAsync();
+        if (_jsModule != null && _peerConnection != null)
+        {
+            await _jsModule.InvokeVoidAsync("close", _peerConnection);
+        }
+        if (_jsModule != null) await _jsModule.DisposeAsync();
+        if (_localStream != null) await _localStream.DisposeAsync();
+    }
+}
